@@ -75,6 +75,7 @@ test_script:
   # first sign of life
   - datalad wtf
   # and now this... [keep appending tests that should work!!]
+  - python -m nose -s -v datalad.support.tests.test_sshrun
   # one call per datalad component for now -- to better see what is being tested
   - python -m nose -s -v datalad.cmdline
   # remaining fails: test_archives.test_basic_scenario test_datalad.test_basic_scenario_local_url
