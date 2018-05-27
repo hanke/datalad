@@ -436,7 +436,7 @@ class SSHManager(object):
             port=sshri.port,
             username=sshri.username)
         # determine control master:
-        ctrl_path = "%s/%s" % (self.socket_dir, conhash)
+        ctrl_path = opj(self.socket_dir, conhash)
 
         # do we know it already?
         if ctrl_path in self._connections:
