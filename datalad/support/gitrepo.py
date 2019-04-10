@@ -3102,7 +3102,20 @@ class GitRepo(RepoInterface):
 
     def diffstatus(self, fr, to, paths=None, untracked='all',
                    ignore_submodules='no', _cache=None):
-        """Like diff(), but reports the status of 'clean' content too"""
+        """Like diff(), but reports the status of 'clean' content too
+
+        Parameters
+        ----------
+        _cache: dict
+          Is populated with and queried for unique responses of
+          GitRepo.get_content_info() for unique argument sets.
+          This can substantially improve performance, when used in
+          the context of dataset recursion (e.g. in status or rev-diff
+          calls), because labeling the state of subdatasets within a
+          superdataset can involved recursion into subdataset, which
+          would lead to duplicate queries during high-level recursion
+          through a dataset hierarchy.
+        """
         def _get_cache_key(label, paths, ref, untracked=None):
             return self.path, label, tuple(paths) if paths else None, \
                 ref, untracked
