@@ -3141,15 +3141,18 @@ class GitRepo(RepoInterface):
             # for each file
             key = _get_cache_key('ci', paths, None, untracked)
             if key in _cache:
+                print('CHIT', key)
                 to_state = _cache[key]
             else:
                 to_state = self.get_content_info(
                     paths=paths, ref=None, untracked=untracked)
+                # TODO record self.path mtime for cache invalidation
                 _cache[key] = to_state
             # we want Git to tell us what it considers modified and avoid
             # reimplementing logic ourselves
             key = _get_cache_key('mod', paths, None)
             if key in _cache:
+                print('CHIT', key)
                 modified = _cache[key]
             else:
                 modified = set(
@@ -3159,10 +3162,12 @@ class GitRepo(RepoInterface):
                         [str(p) for p in paths] if paths else None,
                         ['git', 'ls-files', '-z', '-m'])[0].split('\0')
                     if p)
+                # TODO record self.path mtime for cache invalidation
                 _cache[key] = modified
         else:
             key = _get_cache_key('ci', paths, to)
             if key in _cache:
+                print('CHIT', key)
                 to_state = _cache[key]
             else:
                 to_state = self.get_content_info(paths=paths, ref=to)
@@ -3172,6 +3177,7 @@ class GitRepo(RepoInterface):
         # origin state
         key = _get_cache_key('ci', paths, fr)
         if key in _cache:
+            print('CHIT', key)
             from_state = _cache[key]
         else:
             if fr:
@@ -3248,18 +3254,43 @@ class GitRepo(RepoInterface):
 
         # loop over all subdatasets and look for additional modifications
         for f, st in iteritems(status):
+            f = text_type(f)
             if not (st['type'] == 'dataset' and st['state'] == 'clean' \
-                    and GitRepo.is_valid_repo(str(f))):
+                    and GitRepo.is_valid_repo(f)):
                 # no business here
                 continue
+            # get subds tree mtime for caching
+            subds_mtime = os.stat(f).st_mtime
+
+            cached = _cache.get(f, None)
+            if cached is not None:
+                print("SUBDS_STATE_HIT", f)
+                # we got something, stat the subds and see if the
+                # info is still valid
+                if subds_mtime == cached['mtime']:
+                    print("MTIME_VALID")
+                    # this is still valid
+                    st['state'] = cached['state']
+                    if ignore_submodules == 'other' \
+                            and st['state'] == 'modified':
+                        # we know for sure that at least one subdataset
+                        # is modified -> go home quick
+                        break
+                    continue
+                else:
+                    print("MTIME_INVALID")
+                    # invalidate cache entry
+                    _cache.pop(f)
+
             # we have to recurse into the dataset and get its status
-            subrepo = GitRepo(str(f))
+            subrepo = GitRepo(f)
             # subdataset records must be labeled clean up to this point
             if st['gitshasum'] != subrepo.get_hexsha():
                 # current commit in subdataset deviates from what is
                 # recorded in the dataset, cheap test
                 st['state'] = 'modified'
             else:
+                print('DIVE', f, len(_cache))
                 # the recorded commit did not change, so we need to make
                 # a more expensive traversal
                 rstatus = subrepo.diffstatus(
@@ -3275,6 +3306,13 @@ class GitRepo(RepoInterface):
                 if any(v['state'] != 'clean'
                        for k, v in iteritems(rstatus)):
                     st['state'] = 'modified'
+                print('DIVEDONE', f, len(_cache))
+            # cache the state label
+            print("-> CACHE", f, st['state'], subds_mtime)
+            _cache[f] = dict(
+                state=st['state'],
+                mtime=subds_mtime,
+            )
             if ignore_submodules == 'other' and st['state'] == 'modified':
                 # we know for sure that at least one subdataset is modified
                 # go home quick

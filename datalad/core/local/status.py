@@ -11,6 +11,7 @@
 __docformat__ = 'restructuredtext'
 
 
+import hashlib
 import logging
 import os
 import os.path as op
@@ -22,6 +23,7 @@ from collections import OrderedDict
 
 from datalad.utils import (
     assure_list,
+    Path,
 )
 from datalad.interface.base import (
     Interface,
@@ -49,9 +51,10 @@ from datalad.distribution.dataset import (
     rev_get_dataset_root,
 )
 
-import datalad.utils as ut
-
-from datalad.dochelpers import single_or_plural
+from datalad.dochelpers import (
+    single_or_plural,
+    exc_str,
+)
 
 lgr = logging.getLogger('datalad.core.local.status')
 
@@ -108,9 +111,6 @@ def _yield_status(ds, paths, annexinfo, untracked, recursion_limit, queried, cac
         # recode paths with repo reference for low-level API
         paths=[repo_path / p.relative_to(ds.pathobj) for p in paths] if paths else None,
         untracked=untracked,
-        # TODO think about potential optimizations in case of
-        # recursive processing, as this will imply a semi-recursive
-        # look into subdatasets
         ignore_submodules='other',
         _cache=cache)
     if annexinfo and hasattr(ds.repo, 'get_content_annexinfo'):
@@ -290,7 +290,7 @@ class Status(Interface):
                             # as a whole (in the superdataset)
                             root = super_root
 
-                root = ut.Path(root)
+                root = Path(root)
                 ps = paths_by_ds.get(root, [])
                 ps.append(p)
                 paths_by_ds[root] = ps
@@ -298,7 +298,8 @@ class Status(Interface):
             paths_by_ds[ds.pathobj] = None
 
         queried = set()
-        content_info_cache = {}
+        content_info_cache = _try_load_cache(ds)
+        print('HAVECACHE', len(content_info_cache))
         while paths_by_ds:
             qdspath, qpaths = paths_by_ds.popitem(last=False)
             if qpaths and qdspath in qpaths:
@@ -351,6 +352,7 @@ class Status(Interface):
                     action='status',
                     status='ok',
                 )
+        _store_cache(ds, content_info_cache)
 
     @staticmethod
     def custom_result_renderer(res, **kwargs):  # pragma: no cover
@@ -367,7 +369,7 @@ class Status(Interface):
         refds = refds if kwargs.get('dataset', None) is not None \
             or refds == os.getcwd() else None
         path = res['path'] if refds is None \
-            else str(ut.Path(res['path']).relative_to(refds))
+            else str(Path(res['path']).relative_to(refds))
         type_ = res.get('type', res.get('type_src', ''))
         max_len = len('untracked')
         state = res['state']
@@ -438,3 +440,74 @@ def bytes2human(n, format='%(value).1f %(symbol)sB'):
             value = float(n) / prefix[symbol]
             return format % locals()
     return format % dict(symbol=symbols[0], value=n)
+
+
+# TODO unit test that _store_cache/_try_load_cache cycle
+# does not change the content of cacheable queries
+def _store_cache(ds, cache):
+    if not cache:
+        # don't waste time on nothing
+        return
+
+    from datalad.support.json_py import dump
+
+    cache_dir = ds.pathobj / '.git' / 'datalad' / 'cache' / 'status'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # store under the hashed name the datasets repo is stored under
+    # this makes sure that the cache name is valid across all dataset
+    # instances that point to the same repo, but is invalid/ignored
+    # when the dataset is accessed via a mount on a different machine
+    # under a different path (paths inside the cache are absolute)
+    cache_fname = hashlib.md5(
+        ds.repo.path.encode('utf-8')).hexdigest()
+    dump(
+        # dump as an array because we have complex keys
+        [
+            # key/value as 1st-level array
+            (
+                key,
+                # sets as array
+                [text_type(k) for k in query]
+                if isinstance(query, set)
+                else
+                # dicts with path key
+                {text_type(k): v for k, v in iteritems(query)}
+            )
+            for key, query in iteritems(cache)
+            # any state record
+            if isinstance(key, text_type) \
+            # and only uncontrained work tree queries,
+            # those are the expensive ones
+            or (len(key) == 5 and key[2] is None and key[3] is None)
+        ],
+        cache_dir / '{}.xz'.format(cache_fname),
+        compressed=True
+    )
+
+
+def _try_load_cache(ds):
+    from datalad.support.json_py import load
+    cache_fname = hashlib.md5(
+        ds.repo.path.encode('utf-8')).hexdigest()
+    cache_loc = ds.pathobj / '.git' / 'datalad' / \
+        'cache' / 'status' / '{}.xz'.format(cache_fname)
+    if not cache_loc.exists():
+        return {}
+    try:
+        return {
+            tuple(key) if isinstance(key, list) else key:
+            {Path(k) for k in query}
+            if isinstance(query, list)
+            else
+            {Path(k): v for k, v in iteritems(query)}
+            if isinstance(key, list)
+            else
+            query
+            for key, query in load(
+                text_type(cache_loc),
+                fixup=False,
+                compressed=True)
+        }
+    except Exception as e:
+        lgr.warning('Loading status cache failed: %s', exc_str(e))
+        return {}
