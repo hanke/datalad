@@ -582,20 +582,136 @@ def postclonecfg_ria(ds, props):
     # and was enabled (there could be RIA stores that actually only have repos)
     # make this function be a generator
     ria_remotes = [s for s in ds.siblings('query', result_renderer='disabled')
-                   if s.get('annex-externaltype', None) == 'ora'
-    ]
+                   if s.get('annex-externaltype', None) == 'ora']
     if not ria_remotes:
-        lgr.debug("Found no RIA special remote")
-    elif len(ria_remotes) == 1:
-        yield from ds.siblings('configure',
-                               name='origin',
-                               publish_depends=ria_remotes[0]['name'],
-                               result_filter=None,
-                               result_renderer='disabled')
-    else:
-        lgr.warning("Found multiple RIA remotes. Couldn't decide which "
-                    "publishing to origin should depend on: %s",
-                    [r['name'] for r in ria_remotes])
+        # nothing autoenabled. Let's check origin's config for
+        # datalad.ora-remote.uuid as stored by create-sibling-ria and enable try
+        # enabling that one.
+        lgr.debug("Found no autoenabled ORA special remote. Trying to look it "
+                  "up in source config ...")
+
+        # First figure whether we cloned via SSH, HTTP or local path and then
+        # get that config file the same way:
+        config_content = None
+        scheme = props['giturl'].split(':')[0]
+        if scheme == 'http':
+
+            # Note: Following outcommented code was proof how to check via HTTP.
+            #       However, for now we only want to annexenable origin in case
+            #       of HTTP, not the special remote. Hence it's uuid isn't
+            #       actually required. (see gh-4410)
+
+            # import requests
+            # try:
+            #     response = requests.get("{}{}config".format(
+            #         props['giturl'],
+            #         '/' if not props['giturl'].endswith('/') else '')
+            #     )
+            #     config_content = response.text
+            # except requests.RequestException as e:
+            #     lgr.debug("Failed to get config file from source:\n%s",
+            #               exc_str(e))
+
+            lgr.debug("No ORA reconfiguration for HTTP implemented yet")
+
+        elif scheme == 'ssh':
+
+            # TODO: switch the following to proper command abstraction:
+            from datalad.distributed.ora_remote import SSHRemoteIO, RIARemoteError
+            # SSHRemoteIO ignores the path part ATM. No remote CWD! (To be
+            # changed with command abstractions). So we need to get that part to
+            # have a valid path to origin's config file:
+            from datalad.support.network import URL
+            from datalad.utils import PurePosixPath
+            cfg_path = PurePosixPath(URL(props['giturl']).path) / 'config'
+            op = SSHRemoteIO(props['giturl'])
+            try:
+                config_content = op.read_file(cfg_path)
+            except RIARemoteError as e:
+                lgr.debug("Failed to get config file from source: %s",
+                          e)
+
+        elif scheme == 'file':
+
+            # TODO: switch the following to proper command abstraction:
+            from datalad.distributed.ora_remote import LocalIO, RIARemoteError
+            op = LocalIO()
+            from datalad.support.network import URL
+            cfg_path = Path(URL(props['giturl']).localpath) / 'config'
+            try:
+                config_content = op.read_file(cfg_path)
+            except (RIARemoteError, OSError) as e:
+                lgr.debug("Failed to get config file from source:\n%s",
+                          e)
+        else:
+            lgr.debug("Unknown URL-Scheme in %s. Can currently handle SSH or "
+                      "FILE scheme URLs.", props['source'])
+
+        # 3. And read it
+        org_uuid = None
+        if config_content:
+            from datalad.utils import make_tempfile
+            from datalad.cmd import (
+                GitRunner,
+                WitlessRunner,
+                StdOutCapture
+            )
+
+            with make_tempfile(content=config_content) as cfg_file:
+                runner = WitlessRunner(env=GitRunner.get_git_environ_adjusted())
+                try:
+                    result = runner.run(
+                        ['git', 'config', '-f', cfg_file,
+                         'datalad.ora-remote.uuid'],
+                        protocol=StdOutCapture
+                    )
+                    org_uuid = result['stdout'].strip()
+                except CommandError:
+                    # doesn't contain what we are looking for
+                    lgr.debug("Found no UUID for ORA special remote at "
+                              "'origin'")
+
+        # Now, enable it. If annex-init didn't fail to enable it as stored, we
+        # wouldn't end up here, so enable with store URL as suggested by the URL
+        # we cloned from.
+        if org_uuid:
+            srs = ds.repo.get_special_remotes()
+            if org_uuid in srs.keys():
+                # TODO: - Double-check autoenable value and only do this when
+                #         true?
+                #       - What if still fails? -> Annex shouldn't change config
+                #         in that case
+
+                # we only need the store:
+                new_url = props['source'].split('#')[0]
+                try:
+                    ds.repo.enable_remote(srs[org_uuid]['name'],
+                                          options=['url={}'.format(new_url)]
+                                          )
+                    # update ria_remotes for considering publication dependency
+                    # below
+                    ria_remotes = [s for s in
+                                   ds.siblings('query',
+                                               result_renderer='disabled')
+                                   if s.get('annex-externaltype', None) ==
+                                   'ora']
+                except CommandError as e:
+                    lgr.debug("Failed to reconfigure ORA special remote: %s",
+                              e)
+            else:
+                lgr.debug("Unknown ORA special remote uuid at 'origin': %s",
+                          org_uuid)
+    if ria_remotes:
+        if len(ria_remotes) == 1:
+            yield from ds.siblings('configure',
+                                   name='origin',
+                                   publish_depends=ria_remotes[0]['name'],
+                                   result_filter=None,
+                                   result_renderer='disabled')
+        else:
+            lgr.warning("Found multiple ORA remotes. Couldn't decide which "
+                        "publishing to origin should depend on: %s",
+                        [r['name'] for r in ria_remotes])
 
 
 def postclonecfg_annexdataset(ds, reckless, description=None):

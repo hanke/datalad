@@ -38,6 +38,10 @@ from datalad.distribution.dataset import (
     EnsureDataset,
     require_dataset,
 )
+from datalad.distributed.ora_remote import (
+    LocalIO,
+    SSHRemoteIO,
+)
 from datalad.utils import (
     Path,
     quote_cmdlinearg,
@@ -52,9 +56,11 @@ from datalad.core.distributed.clone import (
     decode_source_spec
 )
 from datalad.log import log_progress
-from datalad.distributed.ria_utils import (
+from datalad.customremotes.ria_utils import (
     get_layout_locations,
     verify_ria_url,
+    create_store,
+    create_ds_in_store
 )
 
 lgr = logging.getLogger('datalad.distributed.create_sibling_ria')
@@ -259,7 +265,7 @@ class CreateSiblingRia(Interface):
         #       in wording
         if existing == 'error':
             # in recursive mode this check could take a substantial amount of
-            # time: employ a progress bar (or rather a counter, because we dont
+            # time: employ a progress bar (or rather a counter, because we don't
             # know the total in advance
             pbar_id = 'check-siblings-{}'.format(id(ds))
             log_progress(
@@ -312,6 +318,28 @@ class CreateSiblingRia(Interface):
             )
             if failed:
                 return
+
+        # TODO: - URL parsing + store creation needs to be RF'ed based on
+        #         command abstractions
+        #       - more generally consider store creation a dedicated command or
+        #         option
+        # Note: URL parsing is done twice ATM (for top-level ds). This can't be
+        # reduced to single instance, since rewriting url based on config could
+        # be different for subdatasets.
+
+        # parse target URL
+        try:
+            ssh_host, base_path, rewritten_url = verify_ria_url(url, ds.config)
+        except ValueError as e:
+            yield get_status_dict(
+                status='error',
+                message=str(e),
+                **res_kwargs
+            )
+            return
+        create_store(SSHRemoteIO(ssh_host) if ssh_host else LocalIO(),
+                     Path(base_path),
+                     '1')
 
         yield from _create_sibling_ria(
             ds,
@@ -449,6 +477,8 @@ def _create_sibling_ria(
         name,
         " and '{}'".format(storage_name) if storage_name else '',
     ))
+    create_ds_in_store(SSHRemoteIO(ssh_host) if ssh_host else LocalIO(),
+                       base_path, ds.id, '2', '1')
     if storage_sibling:
         lgr.debug('init special remote {}'.format(storage_name))
         special_remote_options = [
@@ -486,27 +516,6 @@ def _create_sibling_ria(
                     **res_kwargs
                 )
                 return
-
-        # 1. create remote object store:
-        # Note: All it actually takes is to trigger the special
-        # remote's `prepare` method once.
-        # ATM trying to achieve that by invoking a minimal fsck.
-        # TODO: - It's probably faster to actually talk to the special
-        #         remote (i.e. pretending to be annex and use
-        #         the protocol to send PREPARE)
-        #       - Alternatively we can create the remote directory and
-        #         ria version file directly, but this means
-        #         code duplication that then needs to be kept in sync
-        #         with ria-remote implementation.
-        #       - this leads to the third option: Have that creation
-        #         routine importable and callable from
-        #         ria-remote package without the need to actually
-        #         instantiate a RIARemote object
-        lgr.debug("initializing object store")
-        ds.repo.fsck(
-            remote=storage_name,
-            fast=True,
-            annex_options=['--exclude=*/*'])
 
         if trust_level:
             ds.repo.call_git(['annex', trust_level, storage_name])
